@@ -1,27 +1,22 @@
-
 const express = require("express");
 const multer = require("multer");
-const { PDFDocument } = require("pdf-lib");
-const Jimp = require("jimp");
-const QRCodeReader = require("qrcode-reader");
 const fs = require("fs");
-
+const poppler = require("pdf-poppler");
+const { createCanvas, loadImage } = require("canvas");
+const jsQR = require("jsqr");
 
 const app = express();
 const port = 5000;
 
-app.use(express.json()); // Handle JSON data
-app.use(express.urlencoded({ extended: true })); // Handle form data
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-
-const storage  = multer.memoryStorage();
 
 const upload = multer({
     storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }, 
     fileFilter: (req, file, cb) => {
-        if (!file) {
-            return cb(new Error("No file uploaded"), false);
-        }
+        if (!file) return cb(new Error("No file uploaded"), false);
         if (file.mimetype !== "application/pdf") {
             return cb(new Error("Only PDF files are allowed"), false);
         }
@@ -30,57 +25,82 @@ const upload = multer({
 });
 
 
-//extract qrcode
+const convertPdfToImage = async (pdfBuffer) => {
+    const tempPdfPath = "temp.pdf";
+    fs.writeFileSync(tempPdfPath, pdfBuffer);
 
-const extractQRCode = async (pdfBuffer) => {
+    const options = {
+        format: "png",
+        out_dir: "./",
+        out_prefix: "output",
+        scale: 300
+    };
+
     try {
-        // Load the PDF
-        const pdfDoc = await PDFDocument.load(pdfBuffer);
-        const pages = pdfDoc.getPages();
-
-        if (pages.length === 0) {
-            throw new Error("No pages found in the PDF");
-        }
-
-        // Convert first page to an image
-        const pageImage = await pages[0].render();
-        const imageBuffer = pageImage.items[0].image; 
-
-        const image = await Jimp.read(imageBuffer);
-        const qr = new QRCodeReader();
-
-        return new Promise((resolve, reject) => {
-            qr.callback = (err, value) => {
-                if (err || !value) {
-                    return reject(new Error("No QR code found"));
-                }
-                resolve(value.result);
-            };
-            qr.decode(image.bitmap);
-        });
+        await poppler.convert(tempPdfPath, options);
+        console.log("PDF successfully converted to image");
+        const imageBuffer = fs.readFileSync("output-1.png");
+        fs.unlinkSync(tempPdfPath);
+        return imageBuffer;
     } catch (error) {
-        throw new Error("Failed to extract QR code: " + error.message);
+        throw new Error("Error converting PDF: " + error.message);
     }
 };
+
+
+const extractQRCode = async (pdfBuffer) => {
+    console.log("Starting QR code extraction process...");
+    const imageBuffer = await convertPdfToImage(pdfBuffer);
+    
+    if (!imageBuffer || imageBuffer.length === 0) {
+        throw new Error("Image buffer is empty, failed to convert PDF");
+    }
+    
+    const debugImagePath = "debug.png";
+    fs.writeFileSync(debugImagePath, imageBuffer);
+    console.log("Image saved for debugging at", debugImagePath);
+
+    const image = await loadImage(debugImagePath);
+    const canvas = createCanvas(image.width, image.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(image, 0, 0, image.width, image.height);
+
+    console.log("Extracting pixel data for QR code scanning...");
+    const imageData = ctx.getImageData(0, 0, image.width, image.height);
+    const qrCode = jsQR(imageData.data, image.width, image.height);
+
+    if (!qrCode) {
+        throw new Error("No QR code detected in the image");
+    }
+
+    console.log("QR Code successfully extracted:", qrCode.data);
+    return qrCode.data;
+};
+
 app.post("/api/verify-qr", upload.single("file"), async (req, res) => {
-    console.log("Request received");
-    console.log("Files received:", req.file); // Log file details
+    console.log("Received file for QR verification:", req.file);
 
     try {
         if (!req.file) {
             return res.status(400).json({ success: false, message: "No file uploaded" });
         }
 
-        const pdfBuffer = req.file.buffer;
-        const qrUrl = await extractQRCode(pdfBuffer);
+        if (req.file.size > 10 * 1024 * 1024) {
+            return res.status(400).json({ success: false, message: "File size exceeds limit" });
+        }
 
+        const qrUrl = await extractQRCode(req.file.buffer);
         res.json({ success: true, qrUrl });
     } catch (error) {
-        res.status(400).json({ success: false, message: error.message });
+        console.error("Error processing request:", error.message);
+
+        if (error.message.includes("No QR code detected")) {
+            return res.status(404).json({ success: false, message: "No QR code found in the PDF" });
+        }
+        return res.status(500).json({ success: false, message: "Failed to process the PDF" });
     }
 });
 
-
 app.listen(port, () => {
-console.log(`QR Code Verification API running on http://localhost:${port}`);
+    console.log(`QR Code Verification API is running on http://localhost:${port}`);
 });
